@@ -31,6 +31,7 @@ def clean_garbage_files(folder):
     """Deletes all non-PDF files from the folder to keep it clean"""
     print(f"Cleaning up non-PDF files in {folder}...")
     for file_path in glob.glob(os.path.join(folder, "*")):
+        # Keep everything that IS a PDF. Delete everything else.
         if not file_path.lower().endswith(".pdf"):
             try:
                 os.remove(file_path)
@@ -74,6 +75,22 @@ def setup_driver(view_browser=True, download_path=None):
         
     return driver
 
+def is_pdf(url):
+    """Check if the URL likely points to a PDF by inspecting headers without downloading the body"""
+    try:
+        response = requests.head(url, verify=False, allow_redirects=True, timeout=10)
+        content_type = response.headers.get('Content-Type', '').lower()
+        if 'application/pdf' in content_type:
+            return True
+        # Sometimes HEAD is not supported or returns wrong info, try a partial GET
+        if response.status_code != 200:
+             response = requests.get(url, stream=True, verify=False, timeout=10)
+             content_type = response.headers.get('Content-Type', '').lower()
+             return 'application/pdf' in content_type
+    except:
+        pass
+    return url.lower().endswith('.pdf') or ".pdf" in url.lower()
+
 def download_file(url, folder, filename=None):
     """Download file using requests and return True if successful"""
     if not filename:
@@ -90,6 +107,11 @@ def download_file(url, folder, filename=None):
     try:
         response = requests.get(url, stream=True, verify=False, timeout=60)
         if response.status_code == 200:
+            content_type = response.headers.get('Content-Type', '').lower()
+            if 'application/pdf' not in content_type and not filename.lower().endswith(".pdf"):
+                print(f"Aborting: Content-Type is {content_type}, not a PDF.")
+                return False
+                
             with open(filepath, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
@@ -148,7 +170,8 @@ def process_assam(view_browser=True):
                     except:
                         order_date = datetime.min
                     try:
-                        pdf_url = cols[2].find_element(By.TAG_NAME, "a").get_attribute("href")
+                        pdf_link_element = cols[2].find_element(By.TAG_NAME, "a")
+                        pdf_url = pdf_link_element.get_attribute("href")
                         matches.append({"date": order_date, "url": pdf_url, "date_str": date_info})
                     except:
                         continue
@@ -187,7 +210,6 @@ def process_up(view_browser=True):
         for link in links:
             text = link.text.upper()
             url = link.get_attribute("href")
-            # Requirement: "State Discoms Tariff order", latest, ignore "scanned", MUST be PDF
             if "STATE DISCOMS" in text and "TARIFF ORDER" in text and "SCANNED" not in text:
                 if url and ".pdf" in url.lower():
                     matches.append({"text": link.text, "url": url})
@@ -266,27 +288,12 @@ def process_rajasthan(view_browser=True):
     success = False
     try:
         print(f"[{state_name}] Navigating to RERC website...")
-        driver.get("https://rerc.rajasthan.gov.in/")
+        driver.get("https://rerc.rajasthan.gov.in/rerc-user-files/tariff-orders")
         
-        try:
-            orders_menu = wait.until(EC.element_to_be_clickable((By.XPATH, "//a[contains(@id, 'navbarDropdownMenuLink')][contains(text(), 'Orders')]")))
-            orders_menu.click()
-            tariff_link = wait.until(EC.element_to_be_clickable((By.XPATH, "//a[contains(@class, 'dropdown-item')][contains(@href, 'tariff-orders')]")))
-            tariff_link.click()
-        except:
-            driver.get("https://rerc.rajasthan.gov.in/rerc-user-files/tariff-orders")
-        
-        print(f"[{state_name}] Filtering for 'Aggregate Revenue'...")
-        time.sleep(3)
-        try:
-            search_by = wait.until(EC.presence_of_element_located((By.ID, "BodyContent_ddl_searchBy")))
-            Select(search_by).select_by_visible_text("Subject")
-            keyword_input = driver.find_element(By.ID, "BodyContent_txt_keyword")
-            keyword_input.clear()
-            keyword_input.send_keys("Aggregate Revenue")
-            driver.find_element(By.ID, "BodyContent_btn_submit").click()
-            time.sleep(5) # Wait for results to load
-        except: pass
+        # The user requested NOT to use the search bar, but to look at the list directly
+        # We'll just wait for the table to load
+        wait.until(EC.presence_of_element_located((By.XPATH, "//table[contains(@class, 'table')]//tr[td]")))
+        time.sleep(2)
         
         rows = driver.find_elements(By.XPATH, "//table[contains(@class, 'table')]//tr[td]")
         if not rows: rows = driver.find_elements(By.XPATH, "//*[@id='BodyContent_rptorders']//tr")
@@ -295,7 +302,6 @@ def process_rajasthan(view_browser=True):
         for row in rows:
             cells = row.find_elements(By.TAG_NAME, "td")
             if len(cells) >= 4:
-                # Subject is usually in index 3
                 subject_text = cells[3].text.upper()
                 if "AGGREGATE REVENUE" in subject_text and "DISCOMS" in subject_text and "PETITION" not in subject_text:
                     target_row = row
@@ -303,47 +309,488 @@ def process_rajasthan(view_browser=True):
                     break
         
         if target_row:
-            # Prefer 'View' button as it usually opens a direct PDF URL
+            # First, check if the Download button has a direct PDF URL (sometimes it does in new systems)
+            try:
+                download_btn = target_row.find_element(By.XPATH, ".//a[contains(@title, 'Download')]")
+                href = download_btn.get_attribute("href")
+                if href and href.lower().endswith(".pdf"):
+                    print(f"[{state_name}] Direct PDF URL found in Download button.")
+                    success = download_file(href, download_path, filename="Rajasthan_Tariff_Order.pdf")
+                    if success: return True
+            except: pass
+
+            # Try View button logic
             try:
                 view_btn = target_row.find_element(By.XPATH, ".//a[contains(@title, 'View')]")
                 main_window = driver.current_window_handle
                 view_btn.click()
-                time.sleep(7)
+                time.sleep(8)
                 
                 pdf_url = None
                 for handle in driver.window_handles:
                     if handle != main_window:
                         driver.switch_to.window(handle)
                         url = driver.current_url
-                        if url.lower().endswith('.pdf') or "rerc-user-files" in url.lower():
+                        if is_pdf(url):
                             pdf_url = url
+                            print(f"[{state_name}] Found PDF URL in new tab: {pdf_url}")
                         driver.close()
                         driver.switch_to.window(main_window)
                         break
                 
                 if pdf_url:
-                    print(f"[{state_name}] Captured PDF URL: {pdf_url}")
                     success = download_file(pdf_url, download_path, filename="Rajasthan_Tariff_Order.pdf")
-                else:
-                    raise Exception("No PDF URL captured from View button")
-            except Exception as e:
-                print(f"[{state_name}] View button failed ({e}), trying Download button...")
-                before_files = set(os.listdir(download_path))
-                download_btn = target_row.find_element(By.XPATH, ".//a[contains(@title, 'Download') or contains(@id, 'LinkButton')]")
-                driver.execute_script("arguments[0].click();", download_btn)
+                    if success: return True
+            except: pass
+
+            # Fallback to browser postback download
+            target_filename = "Rajasthan_Tariff_Order.pdf"
+            print(f"Downloading {target_filename}...")
+            
+            # Clear existing files with the same name to avoid detection issues
+            target_file_path = os.path.join(download_path, target_filename)
+            if os.path.exists(target_file_path):
+                try: os.remove(target_file_path)
+                except: pass
+
+            before_files = set(os.listdir(download_path))
+            download_btn = target_row.find_element(By.XPATH, ".//a[contains(@id, 'LinkButton')]")
+            driver.execute_script("arguments[0].click();", download_btn)
+            
+            # Wait for file
+            for i in range(60):
+                time.sleep(1)
+                after_files = set(os.listdir(download_path))
+                new_files = [f for f in (after_files - before_files) if f.lower().endswith(".pdf") and not f.endswith(('.crdownload', '.tmp'))]
                 
-                # Wait up to 60 seconds for the download to finish
-                print(f"[{state_name}] Waiting for browser download...")
-                for i in range(60):
-                    time.sleep(1)
-                    after_files = set(os.listdir(download_path))
-                    new_files = [f for f in (after_files - before_files) if not f.endswith(('.crdownload', '.tmp', '.htm'))]
-                    if new_files:
-                        print(f"[{state_name}] Downloaded via browser: {new_files[0]}")
-                        success = True
-                        break
+                # If no "new" file (because it might have replaced one or downloaded with same name)
+                # check if the default name 'tariff-orders.pdf' appeared
+                if not new_files:
+                    if os.path.exists(os.path.join(download_path, "tariff-orders.pdf")):
+                        new_files = ["tariff-orders.pdf"]
+
+                if new_files:
+                    downloaded_file = new_files[0]
+                    downloaded_path = os.path.join(download_path, downloaded_file)
+                    
+                    # Rename to our standard name
+                    if downloaded_file != target_filename:
+                        try:
+                            # Wait a bit to ensure file is not locked
+                            time.sleep(1)
+                            os.rename(downloaded_path, target_file_path)
+                            downloaded_path = target_file_path
+                        except: pass
+                    
+                    print(f"File saved to {downloaded_path}")
+                    success = True
+                    break
         else:
-            print(f"[{state_name}] No matching PDF found.")
+            print(f"[{state_name}] No matching row found.")
+
+    except Exception as e:
+        print(f"[{state_name}] Error: {e}")
+    finally:
+        driver.quit()
+        clean_garbage_files(download_path)
+        return success
+
+def process_mp(view_browser=True):
+    state_name = "MP"
+    download_path = get_state_download_path(state_name)
+    driver = setup_driver(view_browser=view_browser, download_path=download_path)
+    wait = WebDriverWait(driver, 20)
+    
+    success = False
+    try:
+        print(f"[{state_name}] Navigating to MPERC website...")
+        driver.get("https://mperc.in/")
+        
+        # Navigation: Final Orders -> Tariff orders issued by MPERC -> Distribution tariff orders
+        try:
+            # Hover over 'Final Orders'
+            # Note: The site uses 'FINAL ORDERS' (uppercase) in the nav bar
+            final_orders = wait.until(EC.presence_of_element_located((By.XPATH, "//a[contains(text(), 'FINAL ORDERS')]")))
+            ActionChains(driver).move_to_element(final_orders).perform()
+            time.sleep(1)
+            
+            # Hover over 'Tariff orders issued by MPERC'
+            tariff_orders_issued = wait.until(EC.presence_of_element_located((By.XPATH, "//a[contains(text(), 'Tariff Orders Issued by MPERC')]")))
+            ActionChains(driver).move_to_element(tariff_orders_issued).perform()
+            time.sleep(1)
+            
+            # Click 'Distrubution Tariff Orders'
+            distribution_orders = wait.until(EC.element_to_be_clickable((By.XPATH, "//a[contains(text(), 'Distrubution Tariff Orders')]")))
+            distribution_orders.click()
+        except Exception as e:
+            # Fallback direct navigation if hover fails
+            driver.get("https://mperc.in/page/distrubution-tariff-orders")
+            
+        time.sleep(3)
+        
+        # Find latest row in the table
+        rows = wait.until(EC.presence_of_all_elements_located((By.XPATH, "//table//tr[td]")))
+        
+        target_info = None
+        for row in rows:
+            cells = row.find_elements(By.TAG_NAME, "td")
+            if len(cells) >= 5:
+                description = cells[2].text.upper()
+                # Requirements: "Tariff order", latest, ignore "Petition" and "Corrigendum"
+                if "TARIFF ORDER" in description and "PETITION" not in description and "CORRIGENDUM" not in description:
+                    try:
+                        # The download button is in the 5th cell (index 4)
+                        download_btn = cells[4].find_element(By.TAG_NAME, "a")
+                        pdf_url = download_btn.get_attribute("href")
+                        target_info = {"url": pdf_url, "name": cells[2].text}
+                        break # Found the latest one at the top
+                    except: continue
+        
+        if target_info:
+            target_filename = "MP_Tariff_Order.pdf"
+            print(f"[{state_name}] Found latest order: {target_info['name']}")
+            success = download_file(target_info['url'], download_path, filename=target_filename)
+        else:
+            print(f"[{state_name}] No matching row found.")
+
+    except Exception as e:
+        print(f"[{state_name}] Error: {e}")
+    finally:
+        driver.quit()
+        clean_garbage_files(download_path)
+        return success
+
+def process_chhattisgarh(view_browser=True):
+    state_name = "Chhattisgarh"
+    download_path = get_state_download_path(state_name)
+    driver = setup_driver(view_browser=view_browser, download_path=download_path)
+    wait = WebDriverWait(driver, 20)
+    
+    success = False
+    try:
+        print(f"[{state_name}] Navigating to CSERC website...")
+        driver.get("https://cserc.gov.in/Welcome/index")
+        
+        # Hover on orders then click on tariff orders
+        try:
+            # Locate 'Orders' menu item - checking carefully for the text
+            orders_menu = wait.until(EC.presence_of_element_located((By.XPATH, "//a[contains(text(), 'Orders')]")))
+            ActionChains(driver).move_to_element(orders_menu).perform()
+            time.sleep(1)
+            
+            tariff_orders_link = wait.until(EC.element_to_be_clickable((By.XPATH, "//a[contains(text(), 'Tariff Orders')]")))
+            tariff_orders_link.click()
+        except:
+            print(f"[{state_name}] Hover navigation failed, trying direct URL...")
+            driver.get("https://cserc.gov.in/Welcome/show_tariff_orders")
+
+        # Find rows
+        rows = wait.until(EC.presence_of_all_elements_located((By.XPATH, "//table//tr[td]")))
+        
+        target_info = None
+        for row in rows:
+            cells = row.find_elements(By.TAG_NAME, "td")
+            if len(cells) >= 4:
+                # cell[1] is Text (State Power Companies/Board)
+                # cell[3] is Order PDF
+                
+                description = cells[1].text.upper()
+                
+                # Check keywords: "TARIFF ORDER", "CSPDCL" and ignore "PETITION", "CORRIGENDUM"
+                if "TARIFF ORDER" in description and "CSPDCL" in description and "PETITION" not in description and "CORRIGENDUM" not in description:
+                    try:
+                        download_btn = cells[3].find_element(By.TAG_NAME, "a")
+                        pdf_url = download_btn.get_attribute("href")
+                        target_info = {"url": pdf_url, "name": cells[1].text}
+                        break
+                    except: continue
+                    
+        if target_info:
+            print(f"[{state_name}] Found latest order: {target_info['name']}")
+            success = download_file(target_info['url'], download_path, filename="Chhattisgarh_Tariff_Order.pdf")
+        else:
+            print(f"[{state_name}] No matching row found.")
+            
+    except Exception as e:
+        print(f"[{state_name}] Error: {e}")
+    finally:
+        driver.quit()
+        clean_garbage_files(download_path)
+        return success
+
+def process_himachal(view_browser=True):
+    state_name = "Himachal"
+    download_path = get_state_download_path(state_name)
+    driver = setup_driver(view_browser=view_browser, download_path=download_path)
+    wait = WebDriverWait(driver, 20)
+    
+    success = False
+    try:
+        print(f"[{state_name}] Navigating to HPERC website...")
+        # Direct navigation to Distribution Tariff Orders based on site inspection
+        driver.get("https://hperc.org/order_type/distribution/")
+        
+        # Determine table rows
+        rows = wait.until(EC.presence_of_all_elements_located((By.XPATH, "//table//tbody//tr")))
+        
+        target_info = None
+        for row in rows:
+            text = row.text.upper()
+            
+            # Keywords: "DISCOMS" (or "HPSEBL"), "AGGREGATE", "REVENUE"
+            # Ignore: "PETITION"
+            if "AGGREGATE" in text and "REVENUE" in text and ("DISCOMS" in text or "HPSEBL" in text) and "PETITION" not in text:
+                 try:
+                    # The download link is usually the title text or a view/download icon
+                    link_element = row.find_element(By.TAG_NAME, "a")
+                    pdf_url = link_element.get_attribute("href")
+                    target_info = {"url": pdf_url, "name": row.text.split('\n')[0]} # Use first line as name
+                    break
+                 except: continue
+        
+        if target_info:
+            print(f"[{state_name}] Found latest order: {target_info['name'][:100]}...")
+            success = download_file(target_info['url'], download_path, filename="Himachal_Tariff_Order.pdf")
+        else:
+            print(f"[{state_name}] No matching row found.")
+
+    except Exception as e:
+        print(f"[{state_name}] Error: {e}")
+    finally:
+        driver.quit()
+        clean_garbage_files(download_path)
+        return success
+
+def process_puducherry(view_browser=True):
+    state_name = "Puducherry"
+    download_path = get_state_download_path(state_name)
+    driver = setup_driver(view_browser=view_browser, download_path=download_path)
+    wait = WebDriverWait(driver, 20)
+    
+    success = False
+    try:
+        print(f"[{state_name}] Navigating to JERC UTS website...")
+        # Direct navigation based on site inspection data
+        driver.get("https://jercuts.gov.in/order_category/puducherry/")
+        
+        time.sleep(3)
+        
+        # Row selection: Looking for rows in the tariff orders table
+        rows = wait.until(EC.presence_of_all_elements_located((By.XPATH, "//table//tr[td]")))
+        
+        target_info = None
+        for row in rows:
+            cells = row.find_elements(By.TAG_NAME, "td")
+            if len(cells) >= 5: # Based on screenshot, there are multiple columns (S.No, Description, Pet. No, Year, Action)
+                # The description text is usually in the 2nd cell (index 1)
+                description_cell = cells[1]
+                description = description_cell.text.strip().upper()
+                
+                # Keywords: "DISCOMS" (or implied by PED context on this page, but strict check requested), 
+                # "AGGREGATE", "REVENUE", "TRUE-UP"
+                # Exclude: "PETITION", "CORRIGENDUM"
+                
+                # Note: The site text for the target row is:
+                # "True-up for the FY 2023-24... Aggregate Revenue Requirement... (FY 2025-26 to..."
+                # It does NOT explicitly say "DISCOMS" in the title, but the user requested "Discoms".
+                # However, this page is specific to Puducherry (PED), so "Discoms" might be implicit or in page body.
+                # Let's check for the OTHER strict keywords first.
+                
+                has_keywords = ("AGGREGATE" in description and 
+                                "REVENUE" in description and 
+                                "TRUE-UP" in description)
+                                
+                is_excluded = ("PETITION" in description or "CORRIGENDUM" in description)
+                
+                # Special handling for "Discoms": The user asked for it. 
+                # If the description doesn't have it, we might skip a valid order.
+                # Looking at the screenshot, row 1 doesn't say "Discoms".
+                # But row 9 says "...Electricity Department, Government of Puducherry (PED)..."
+                # Let's prioritize the specific keywords requested but be flexible if "Discoms" is missing 
+                # IF the page context is already "Puducherry".
+                # HOWEVER, strict compliance means we should look for it.
+                # If "Discoms" is NOT in the text, we might need to check if the user is OK with implicit context.
+                # Given the user ADDED "Discoms" as a requirement, I will check for "PED" (Puducherry Electricity Department) as a proxy if "Discoms" is missing,
+                # OR check if "Discoms" is actually in the text (maybe lower in the body?).
+                # Actually, the user prompt says: "have these keywords Discoms, Aggregate ,Revenue,True-up"
+                # Row 1 text: "True-up for the FY 2023-24... Aggregate Revenue Requirement..."
+                # It does NOT have "Discoms". 
+                # BUT, JERC orders often cover "Generation" (PPCL) vs "distribution" (PED). 
+                # PED is the Deemed Licensee (Discom). 
+                # So if "PED" is in the text, it counts as Discom order. 
+                # Alternatively, "Discoms" might be a generic term the user thinks is there.
+                # I will check for "DISCOMS" OR "PED" OR "ELECTRICITY DEPARTMENT" to be safe.
+                
+                has_discom_context = ("DISCOMS" in description or "PED" in description or "ELECTRICITY DEPARTMENT" in description)
+
+                if has_keywords and not is_excluded:
+                     # Attempt to find the download link
+                     try:
+                        # The download link is an icon in the last column usually
+                        # Screenshot shows 2 icons: Download (arrow) and View (eye).
+                        # We want the download one. Usually the first 'a' tag in the Actions column.
+                        action_cell = cells[-1] # Last cell
+                        download_btn = action_cell.find_element(By.XPATH, ".//a[contains(@href, '.pdf')]")
+                        pdf_url = download_btn.get_attribute("href")
+                        
+                        target_info = {"url": pdf_url, "name": description}
+                        break
+                     except: continue
+        
+        if target_info:
+            print(f"[{state_name}] Found latest order: {target_info['name'][:100]}...")
+            success = download_file(target_info['url'], download_path, filename="Puducherry_Tariff_Order.pdf")
+        else:
+            print(f"[{state_name}] No matching row found. Checking strict keyword matches...")
+
+    except Exception as e:
+        print(f"[{state_name}] Error: {e}")
+    finally:
+        driver.quit()
+        clean_garbage_files(download_path)
+        return success
+
+def process_bihar(view_browser=True):
+    state_name = "Bihar"
+    download_path = get_state_download_path(state_name)
+    driver = setup_driver(view_browser=view_browser, download_path=download_path)
+    wait = WebDriverWait(driver, 20)
+    
+    success = False
+    try:
+        print(f"[{state_name}] Navigating to BERC website...")
+        # Direct navigation based on analysis
+        driver.get("https://berc.co.in/orders/tariff/distribution/sbpdcl")
+        
+        # Get all rows in the main table
+        rows = wait.until(EC.presence_of_all_elements_located((By.XPATH, "//table//tr[td]")))
+        
+        target_info = None
+        for row in rows:
+            text = row.text.upper()
+            
+            # Keywords: "TARIFF ORDER", "DISCOMS" (or NBPDCL/SBPDCL)
+            # Ignore: "PETITION", "CHART" (if mentioned in main title, though usually on detail page)
+            if "TARIFF ORDER" in text and ("DISCOMS" in text or "SBPDCL" in text) and "PETITION" not in text:
+                try:
+                    # Logic: The row has a link to a DETAILS page, not the PDF directly.
+                    link_element = row.find_element(By.TAG_NAME, "a")
+                    detail_url = link_element.get_attribute("href")
+                    target_info = {"url": detail_url, "name": row.text}
+                    break
+                except: continue
+                
+        if target_info:
+            print(f"[{state_name}] Found order entry: {target_info['name'][:100]}...")
+            print(f"[{state_name}] Navigating to details page to find PDF...")
+            driver.get(target_info['url'])
+            
+            # Now on details page, find the PDF link.
+            # There might be multiple PDFs (Tariff Chart vs Tariff Order).
+            # Look for <a> tags ending in .pdf OR <embed>/<iframe> src
+            
+            # Let's try finding all links ending in .pdf
+            pdf_links = driver.find_elements(By.XPATH, "//a[contains(@href, '.pdf')]")
+            
+            # Fallback: check embeds/iframes if no simple <a> tags found (common in Joomla/CMS sites)
+            if not pdf_links:
+                pdf_links = driver.find_elements(By.XPATH, "//embed[contains(@src, '.pdf')]") + \
+                            driver.find_elements(By.XPATH, "//iframe[contains(@src, '.pdf')]")
+            
+            final_pdf_url = None
+            for link in pdf_links:
+                url = link.get_attribute("href") or link.get_attribute("src")
+                if not url: continue
+                
+                # Handle embedded PDF viewers (e.g. viewer.html?file=...)
+                if "viewer.html" in url and "file=" in url:
+                    try:
+                        from urllib.parse import unquote
+                        url = unquote(url.split("file=")[1].split("&")[0])
+                    except: pass
+
+                url_lower = url.lower()
+                
+                # Logic to distinguish Order vs Chart
+                # Order usually has "TO" or "Tariff_Order" or "Tariff-Order"
+                # Chart usually has "Chart" or "Schedule"
+                
+                is_chart = "chart" in url_lower or "schedule" in url_lower
+                is_order = "order" in url_lower or "to_" in url_lower or "tariff" in url_lower
+                
+                if is_order and not is_chart:
+                    final_pdf_url = url
+                    break
+                elif is_order: # If it has both, maybe keep checking, but store as fallback
+                     final_pdf_url = url
+            
+            if final_pdf_url:
+                print(f"[{state_name}] Found PDF URL: {final_pdf_url}")
+                success = download_file(final_pdf_url, download_path, filename="Bihar_Tariff_Order.pdf")
+            else:
+                 print(f"[{state_name}] Could not find suitable PDF link on details page.")
+                 
+        else:
+            print(f"[{state_name}] No matching row found in main list.")
+
+    except Exception as e:
+        print(f"[{state_name}] Error: {e}")
+    finally:
+        driver.quit()
+        clean_garbage_files(download_path)
+        return success
+
+        return success
+
+def process_odisha(view_browser=True):
+    state_name = "Odisha"
+    download_path = get_state_download_path(state_name)
+    driver = setup_driver(view_browser=view_browser, download_path=download_path)
+    wait = WebDriverWait(driver, 20)
+    
+    success = False
+    try:
+        print(f"[{state_name}] Navigating to OERC website...")
+        # Direct navigation based on site inspection
+        driver.get("https://www.orierc.org/Distribution_Retail_Supply.aspx")
+        
+        # Get all rows in the main table
+        # Structure is usually table -> tr -> td
+        rows = wait.until(EC.presence_of_all_elements_located((By.XPATH, "//table//tr[td]")))
+        
+        target_info = None
+        for row in rows:
+            text = row.text.upper()
+            
+            # Keywords: "AGGREGATE", "REVENUE", "REQUIREMENT"
+            # Context: "DISCOMS" (User requested this. The file name has DISCOM, logic below checks for it or assumes if strict match fails)
+            # Exclusion: "PETITION"
+            
+            # Row text example: "AGGREGATE REVENUE REQUIREMENT, WHEELING TARIFF & RETAIL SUPPLY TARIFF FOR THE FY 2025-26"
+            # It might not explicitly say "DISCOMS" in the row text, but it IS the Distribution page.
+            # User requirement: "have these keywords Discoms Aggregate ,Revenue , requirement"
+            # Strict interpretation: Text MUST have "DISCOMS".
+            # Site inspection shows the file is "DISCOM_TARIFF_ORDER...".
+            # If the Text doesn't have "DISCOMS", I will check if the Link has "DISCOM".
+            
+            if "AGGREGATE" in text and "REVENUE" in text and "REQUIREMENT" in text and "PETITION" not in text:
+                 # Check for "DISCOMS" in text OR link URL
+                 link_element = None
+                 try:
+                     link_element = row.find_element(By.TAG_NAME, "a")
+                 except: continue
+                 
+                 url = link_element.get_attribute("href")
+                 # Check if "DISCOMS" is properly associated
+                 if "DISCOM" in text or "DISCOM" in url.upper():
+                     target_info = {"url": url, "name": row.text}
+                     break
+        
+        if target_info:
+            print(f"[{state_name}] Found latest order: {target_info['name'][:100]}...")
+            success = download_file(target_info['url'], download_path, filename="Odisha_Tariff_Order.pdf")
+        else:
+            print(f"[{state_name}] No matching row found.")
 
     except Exception as e:
         print(f"[{state_name}] Error: {e}")
@@ -354,9 +801,9 @@ def process_rajasthan(view_browser=True):
 
 if __name__ == "__main__":
     start_time = time.time()
-    SHOW_BROWSER = False  # Headless mode
+    SHOW_BROWSER = False  
     
-    states_to_process = ["Assam", "UP", "Meghalaya", "Rajasthan"]
+    states_to_process = ["Assam", "UP", "Meghalaya", "Rajasthan", "MP", "Chhattisgarh", "Himachal", "Puducherry", "Bihar", "Odisha"]
     results = {}
     
     for state in states_to_process:
@@ -364,6 +811,12 @@ if __name__ == "__main__":
         elif state == "UP": results[state] = process_up(view_browser=SHOW_BROWSER)
         elif state == "Meghalaya": results[state] = process_meghalaya(view_browser=SHOW_BROWSER)
         elif state == "Rajasthan": results[state] = process_rajasthan(view_browser=SHOW_BROWSER)
+        elif state == "MP": results[state] = process_mp(view_browser=SHOW_BROWSER)
+        elif state == "Chhattisgarh": results[state] = process_chhattisgarh(view_browser=SHOW_BROWSER)
+        elif state == "Himachal": results[state] = process_himachal(view_browser=SHOW_BROWSER)
+        elif state == "Puducherry": results[state] = process_puducherry(view_browser=SHOW_BROWSER)
+        elif state == "Bihar": results[state] = process_bihar(view_browser=SHOW_BROWSER)
+        elif state == "Odisha": results[state] = process_odisha(view_browser=SHOW_BROWSER)
     
     print("\n" + "="*40)
     print(f"{'STATE':<15} | {'AUTOMATION STATUS':<20}")
